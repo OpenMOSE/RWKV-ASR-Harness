@@ -403,6 +403,21 @@ def placeholder_token(texts, img_nums):
 import lightning as L
 from torch.utils.data import DataLoader
 
+
+def world_collate_fn(batch):
+    """Module-level collate so it stays picklable under multi-GPU / spawned
+    dataloader workers (a nested local function raises
+    'can't pickle local object ...train_dataloader.<locals>.custom_collate_fn')."""
+    cols = list(zip(*batch))
+    signs, inputs_ids, labels = cols[0], cols[1], cols[2]
+    all_images = list(signs)
+    inputs_ids = torch.stack(inputs_ids, dim=0)
+    labels = torch.stack(labels, dim=0)
+    if len(cols) > 3:   # --debug_data: 4th element = per-sample meta ids
+        return all_images, inputs_ids, labels, list(cols[3])
+    return all_images, inputs_ids, labels
+
+
 class WorldDataModule(L.LightningDataModule):
     def __init__(self, args, processor=None):
         super().__init__()
@@ -414,20 +429,11 @@ class WorldDataModule(L.LightningDataModule):
 
 
     def train_dataloader(self):
-        def custom_collate_fn(batch):
-            cols = list(zip(*batch))
-            signs, inputs_ids, labels = cols[0], cols[1], cols[2]
-            all_images = list(signs)
-            inputs_ids = torch.stack(inputs_ids, dim=0)
-            labels = torch.stack(labels, dim=0)
-            if len(cols) > 3:   # --debug_data: 4th element = per-sample meta ids
-                return all_images, inputs_ids, labels, list(cols[3])
-            return all_images, inputs_ids, labels
         return DataLoader(
             self.train_dataset,
             batch_size=self.args.micro_bsz,
             shuffle=True,    # Lightning 自动替换成 DistributedSampler
-            collate_fn=custom_collate_fn,
+            collate_fn=world_collate_fn,
             num_workers=self.args.num_workers,
             pin_memory=True
         )
