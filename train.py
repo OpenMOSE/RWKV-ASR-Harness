@@ -273,15 +273,17 @@ from lg_train.trainer import train_callback
 from lg_train.dataset import WorldDataModule
 from lg_train.world_load import WorldLoading
 
-model = WorldLoading(args)
+# Guard the process-spawning launch: under multi-GPU / spawned dataloader
+# workers the child re-imports this module, and starting Trainer.fit() at import
+# time raises "an attempt has been made to start a new process before the current
+# process has finished its bootstrapping phase". Only the true entrypoint
+# (__main__) builds the model and launches training.
+if __name__ == "__main__":
+    model = WorldLoading(args)
 
+    trainer = Trainer(accelerator=args.accelerator,strategy=args.strategy,devices=args.devices,num_nodes=args.num_nodes,precision=args.precision,
+    logger=args.logger,callbacks=[train_callback(args)],max_epochs=args.max_epochs,check_val_every_n_epoch=args.check_val_every_n_epoch,num_sanity_val_steps=args.num_sanity_val_steps,
+    log_every_n_steps=args.log_every_n_steps,enable_checkpointing=args.enable_checkpointing,accumulate_grad_batches=args.accumulate_grad_batches,gradient_clip_val=args.gradient_clip_val)
 
-
-trainer = Trainer(accelerator=args.accelerator,strategy=args.strategy,devices=args.devices,num_nodes=args.num_nodes,precision=args.precision,
-logger=args.logger,callbacks=[train_callback(args)],max_epochs=args.max_epochs,check_val_every_n_epoch=args.check_val_every_n_epoch,num_sanity_val_steps=args.num_sanity_val_steps,
-log_every_n_steps=args.log_every_n_steps,enable_checkpointing=args.enable_checkpointing,accumulate_grad_batches=args.accumulate_grad_batches,gradient_clip_val=args.gradient_clip_val)
-
-
-
-datamodule = WorldDataModule(args)
-trainer.fit(model, datamodule)
+    datamodule = WorldDataModule(args)
+    trainer.fit(model, datamodule)
