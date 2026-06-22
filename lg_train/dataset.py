@@ -267,15 +267,26 @@ class WorldDataset(Dataset):
     def _load_label_index(self, root):
         """Recursively scan `root` for *.label files and build a (rel_path, text)
         index. Each line: '<audio_path><whitespace><transcript>'. Only the text
-        index is held in memory; audio is decoded on demand in _process_label."""
+        index is held in memory; audio is decoded on demand in _process_label.
+
+        --label_exclude "misc,noise" skips any entry whose audio path (or its
+        source .label file path) contains one of the comma-separated keywords
+        (case-insensitive substring match). Useful to drop e.g. a 'misc/' folder."""
+        excl = (getattr(self.args, "label_exclude", "") or "")
+        keywords = [k.strip().lower() for k in excl.split(",") if k.strip()]
+        n_skipped = 0
+
         index = []
         n_files = 0
         for dirpath, _dirs, files in os.walk(root):
             for fn in files:
                 if not fn.endswith(".label"):
                     continue
-                n_files += 1
                 fpath = os.path.join(dirpath, fn)
+                # skip an entire .label file whose path matches an excluded keyword
+                if keywords and any(kw in fpath.lower() for kw in keywords):
+                    continue
+                n_files += 1
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
                         for line in f:
@@ -286,10 +297,16 @@ class WorldDataset(Dataset):
                             if len(parts) < 2:
                                 continue
                             apath, text = parts[0], parts[1].strip()
+                            # skip a single entry whose audio path matches a keyword
+                            if keywords and any(kw in apath.lower() for kw in keywords):
+                                n_skipped += 1
+                                continue
                             if text:
                                 index.append((apath, text))
                 except Exception as e:
                     print(f"⚠️ skip label file {fpath}: {e}")
+        if keywords:
+            print(f"[label] exclude keywords={keywords} -> skipped {n_skipped} entries (+ matching .label files)")
         print(f"[label] scanned {n_files} .label files -> {len(index)} utterances under {root}")
         return index
 

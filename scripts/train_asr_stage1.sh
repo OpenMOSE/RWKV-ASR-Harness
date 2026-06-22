@@ -17,6 +17,7 @@
 #   N_LAYER N_EMBD VOCAB
 #   MICRO_BSZ CTX_LEN EPOCH_COUNT EPOCH_STEPS EPOCH_SAVE NUM_WORKERS ACCUM GRAD_CP PRECISION
 #   DATA_SHUFFLE  (1=on default, 0=off)
+#   LABEL_EXCLUDE (data_type=label: comma-separated keywords to skip, e.g. "misc,noise")
 #   DEVICES NUM_NODES STRATEGY ACCELERATOR LAUNCHER
 #   TRAIN_STEP LR_INIT LR_FINAL WARMUP LAYERWISE_LR
 #   LORA_TMIX LORA_FFN LORA_ALPHA LORA_DROPOUT
@@ -51,6 +52,7 @@ ACCUM=${ACCUM:-1}                          # accumulate_grad_batches
 GRAD_CP=${GRAD_CP:-1}                      # gradient checkpointing
 PRECISION=${PRECISION:-bf16}
 DATA_SHUFFLE=${DATA_SHUFFLE:-1}            # 1=shuffle index (default), 0=keep scan order
+LABEL_EXCLUDE=${LABEL_EXCLUDE:-}           # data_type=label: comma-separated keywords to skip (e.g. "misc,noise")
 SAVE_PER_STEPS=${SAVE_PER_STEPS:-100}      # dump rwkv-step-N.pth every N steps (0=off)
 KEEP_LAST_CKPT=${KEEP_LAST_CKPT:-5}        # keep only the N most recent rwkv-step-*.pth (0=keep all)
 
@@ -118,6 +120,7 @@ $LAUNCHER python train.py \
   --load_model "$LOAD_MODEL" \
   --proj_dir "$PROJ_DIR" --data_file "$DATA_FILE" \
   --data_type $DATA_TYPE --vocab_size $VOCAB --data_shuffle $DATA_SHUFFLE \
+  --label_exclude "$LABEL_EXCLUDE" \
   --n_layer $N_LAYER --n_embd $N_EMBD \
   --ctx_len $CTX_LEN --micro_bsz $MICRO_BSZ \
   --epoch_steps $EPOCH_STEPS --epoch_count $EPOCH_COUNT --epoch_begin 0 --epoch_save $EPOCH_SAVE \
