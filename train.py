@@ -107,6 +107,8 @@ parser.add_argument("--loss_mask", default="none", type=str)### pad qa se
 parser.add_argument("--mask_id", default='{"mask0":"0", "mask1":"1"}', type=json.loads)
 parser.add_argument("--data_shuffle", default=1, type=int)
 parser.add_argument("--label_exclude", default="", type=str)  # comma-separated keywords; 'label' entries whose audio/label path contains any are skipped (e.g. "misc,noise")
+parser.add_argument("--audio_root", default="", type=str)  # data_type=label: explicit base dir for relative audio paths (tried first)
+parser.add_argument("--resolve_max_up", default=2, type=int)  # data_type=label: parent levels above each .label dir to try for off-by-one paths
 
 
 #new optim

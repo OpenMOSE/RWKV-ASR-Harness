@@ -27,8 +27,34 @@ ja/WAVE/utt_0002.wav おはようございます
 - 1ファイルに複数行を書けます。空行・カラムが1つだけの行はスキップされます。
 - 音声パスにスペースが含まれると `split` が誤るため、警告（`warn`）として検出します。
 
-> パス解決は学習側と同じく2候補（`dirname(root)` と `root`）を試し、
-> 最初に存在したものにキャッシュします。
+### パス解決（混在・1階層ズレに対応）
+
+`.label` 内の音声パスは現実にはバラつきます（絶対 / `.label` 基準の相対 / データ
+セットルート基準 / 1階層余分・不足など）。チェッカーは次の候補を**優先順に総当り**
+し、各 `.label` ディレクトリごとに成功した方式をキャッシュします:
+
+1. `AUDIO_ROOT`（指定時。最優先）
+2. `.label` ファイル自身のディレクトリ
+3. その親を `MAX_UP` 階層まで遡る（不足ズレ対策）
+4. データセットルート / その親
+   - 各 base について「そのまま」と「先頭1階層を除去（余分ズレ対策）」を試行
+
+SUMMARY に **どの方式で解決できたかの内訳**と解決率が出ます:
+
+```
+path resolution: {'label_dir-1:asis': 41000, 'abs': 1200, 'MISSING': 30}
+               resolved 42200/42230 (99.9%) | MISSING 30
+```
+
+`missing` の行には実際に試した候補パスが併記されるので、ベースディレクトリの
+指定ミス（`AUDIO_ROOT` / `MAX_UP` で調整）か、本当に存在しないのかを判別できます。
+
+> ✅ **学習側も同じ解決ロジックに更新済み:** `WorldDataset._resolve_audio_path`
+> はこのチェッカーと同じ多方式解決（`.label` 基準・親遡り・1階層ズレ・`audio_root`）
+> になりました。`train.py` の `--audio_root` / `--resolve_max_up`、または
+> `train_asr_stage1.sh` の `AUDIO_ROOT` / `RESOLVE_MAX_UP` で同様に調整できます。
+> さらに学習中はスキップ率を `[label] skip rate XX% (...)` として定期表示するので、
+> サイレントなデータ欠落（＝過学習の原因）にすぐ気づけます。
 
 ---
 
@@ -69,6 +95,7 @@ ROOT=/share/voice-dataset STRICT=1 ./scripts/check_label.sh
 | `EXAMPLES` | `8` | カテゴリごとに表示する問題例の数 |
 | `REPORT` | `label_check_report.jsonl` | 問題行の**全リスト**を書き出す JSONL パス |
 | `NO_REPORT` | `0` | `1` でレポートファイルを書かない |
+| `DECODE_ERRORS` | `skip` | UTF-8 として不正な `.label` ファイルの扱い。`skip`=警告してファイルごとスキップ / `ignore`=不正バイトのみ捨てて有効行は採用 |
 | `STRICT` | `0` | `1` で問題検出時に exit code 1 |
 
 ### 3TB 級データのおすすめワークフロー
@@ -187,6 +214,19 @@ PASS — index loads, audio decodes, and placeholder/label extraction aligns.
 | `warn` | 音声拡張子が無い等のパース疑い | `.label` の区切り（パス中のスペース）を確認 |
 
 ---
+
+## 文字エンコーディング異常への耐性
+
+`.label` が UTF-8 として不正なバイト（例: `0xf1`）を含む場合でも処理は止まりません。
+
+- 既定（`DECODE_ERRORS=skip`）: そのファイルを **警告付きでスキップ**し、
+  `[warn] skip .label (not valid UTF-8: ...)` と表示。INDEX サマリに
+  `.label files skipped : N (not valid UTF-8)` として件数が出ます。
+- `DECODE_ERRORS=ignore`: 不正バイトだけを捨て、そのファイルの**有効行は採用**します。
+
+また、巨大コーパスでインデックス構築が無言にならないよう、
+`[index] scanned N .label files | M entries kept | skipped(bad-utf8)=K | 秒数`
+の進捗を 5000 ファイルごとに表示します（「警告の後フリーズ」に見える問題を解消）。
 
 ## 依存パッケージ
 

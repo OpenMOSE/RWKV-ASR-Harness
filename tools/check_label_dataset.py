@@ -96,21 +96,32 @@ IMAGE_TOKEN_ID = 65532
 # --------------------------------------------------------------------------- #
 # label index — mirrors WorldDataset._load_label_index
 # --------------------------------------------------------------------------- #
-def load_label_index(root, keywords, frac=None, seed=42):
+def load_label_index(root, keywords, frac=None, seed=42, decode_errors="skip",
+                     progress_every=5000):
     """Return list of (label_file, lineno, audio_path, text). `keywords` is a
     lower-cased list; entries / files whose path contains one are skipped.
 
     frac in (0,1]: STRATIFIED sample — keep a random ceil(frac*N) of the valid
     entries of EACH .label file (so the 95% you don't sample are never touched
     downstream: no path resolution, no header read, no decode). This is the way
-    to spot-check a multi-TB corpus. A fixed `seed` makes the sample reproducible."""
+    to spot-check a multi-TB corpus. A fixed `seed` makes the sample reproducible.
+
+    decode_errors: how to handle a .label file that is not valid UTF-8:
+      'skip'   -> warn and skip the WHOLE file (default).
+      'ignore' -> drop the offending bytes and keep the file's good lines.
+    Index building prints progress every `progress_every` files so a huge corpus
+    never looks frozen."""
     do_sample = frac is not None and 0 < frac < 1.0
     rng = random.Random(seed)
+    open_errors = "ignore" if decode_errors == "ignore" else "strict"
     index = []
     n_files = n_files_excluded = 0
     n_excluded_entries = 0
     n_bad_lines = 0
     n_before_sample = 0
+    n_decode_error = 0          # .label files skipped: not valid UTF-8
+    n_read_error = 0            # .label files skipped: OS/read error
+    t0 = time.time()
     for dirpath, _dirs, files in os.walk(root):
         for fn in files:
             if not fn.endswith(".label"):
@@ -120,9 +131,13 @@ def load_label_index(root, keywords, frac=None, seed=42):
                 n_files_excluded += 1
                 continue
             n_files += 1
+            if progress_every and n_files % progress_every == 0:
+                print(f"[index] scanned {n_files} .label files | {len(index)} entries kept "
+                      f"| skipped(bad-utf8)={n_decode_error} | {time.time()-t0:.0f}s",
+                      flush=True)
             file_entries = []
             try:
-                with open(fpath, "r", encoding="utf-8") as f:
+                with open(fpath, "r", encoding="utf-8", errors=open_errors) as f:
                     for lineno, line in enumerate(f, 1):
                         line = line.rstrip("\n").rstrip("\r")
                         if not line:
@@ -139,8 +154,14 @@ def load_label_index(root, keywords, frac=None, seed=42):
                             n_excluded_entries += 1
                             continue
                         file_entries.append((fpath, lineno, apath, text))
-            except Exception as e:
-                print(f"[warn] cannot read label file {fpath}: {e}")
+            except UnicodeDecodeError as e:
+                # not valid UTF-8 (e.g. byte 0xf1) -> skip the file, keep going
+                n_decode_error += 1
+                print(f"[warn] skip .label (not valid UTF-8: {e}): {fpath}", flush=True)
+                continue
+            except OSError as e:
+                n_read_error += 1
+                print(f"[warn] skip .label (read error: {e}): {fpath}", flush=True)
                 continue
             n_before_sample += len(file_entries)
             if do_sample and file_entries:
@@ -148,29 +169,90 @@ def load_label_index(root, keywords, frac=None, seed=42):
                 file_entries = rng.sample(file_entries, k)
             index.extend(file_entries)
     return index, dict(n_files=n_files, n_files_excluded=n_files_excluded,
+                       n_decode_error=n_decode_error, n_read_error=n_read_error,
                        n_excluded_entries=n_excluded_entries, n_bad_lines=n_bad_lines,
                        n_before_sample=n_before_sample, sampled=do_sample, frac=frac)
 
 
 # --------------------------------------------------------------------------- #
-# path resolution — mirrors WorldDataset._resolve_audio_path
+# path resolution — robust to the messy real world: a .label entry's audio path
+# may be absolute, relative to the .label file's own dir, relative to the dataset
+# root (or its parent), or off-by-one (an extra/missing leading directory).
+# We try a prioritized set of (base, transform) candidates and CACHE the winning
+# scheme per .label directory so only the first entry of each file pays the cost.
+# resolve() returns (path, scheme, tried): scheme is None when nothing existed.
 # --------------------------------------------------------------------------- #
 class PathResolver:
-    def __init__(self, label_root):
+    def __init__(self, label_root, audio_root=None, max_up=2):
         self.label_root = os.path.normpath(label_root)
-        self._base = None
+        self.audio_root = os.path.normpath(audio_root) if audio_root else None
+        self.max_up = max_up
+        self._cache = {}     # label_dir -> winning (base_path, transform_name)
 
-    def resolve(self, rel):
+    def _bases(self, label_dir):
+        """Candidate base directories, most-likely first."""
+        bases = []
+        if self.audio_root:
+            bases.append(("audio_root", self.audio_root))
+        bases.append(("label_dir", label_dir))           # path relative to the .label file
+        d = label_dir
+        for i in range(1, self.max_up + 1):               # walk up: off-by-one (missing dir)
+            d = os.path.dirname(d)
+            if not d:
+                break
+            bases.append((f"label_dir-{i}", d))
+        bases.append(("root", self.label_root))
+        bases.append(("root_parent", os.path.dirname(self.label_root)))
+        # dedup preserving order
+        seen, out = set(), []
+        for name, b in bases:
+            if b and b not in seen:
+                seen.add(b); out.append((name, b))
+        return out
+
+    @staticmethod
+    def _apply(base, tname, rel):
+        if tname == "asis":
+            r = rel
+        elif tname == "strip1":                           # off-by-one (extra leading dir)
+            parts = rel.split(os.sep)
+            if len(parts) <= 1:
+                return None
+            r = os.sep.join(parts[1:])
+        else:
+            return None
+        return os.path.join(base, r)
+
+    TRANSFORMS = ("asis", "strip1")
+
+    def resolve(self, rel, label_file):
         if os.path.isabs(rel):
-            return rel
-        if self._base is not None:
-            return os.path.join(self._base, rel)
-        candidates = [os.path.dirname(self.label_root), self.label_root]
-        for base in candidates:
-            if os.path.exists(os.path.join(base, rel)):
-                self._base = base
-                return os.path.join(base, rel)
-        return os.path.join(candidates[0], rel)   # default; will fail existence
+            ok = os.path.exists(rel)
+            return rel, ("abs" if ok else None), [rel]
+
+        label_dir = os.path.dirname(label_file)
+        tried = []
+
+        # fast path: reuse the scheme that already worked for this .label dir
+        plan = self._cache.get(label_dir)
+        if plan is not None:
+            base, tname = plan
+            cand = self._apply(base, tname, rel)
+            if cand and os.path.exists(cand):
+                return cand, tname, tried
+
+        # full search over (base, transform), most-likely first
+        for bname, base in self._bases(label_dir):
+            for tname in self.TRANSFORMS:
+                cand = self._apply(base, tname, rel)
+                if not cand:
+                    continue
+                tried.append(cand)
+                if os.path.exists(cand):
+                    self._cache[label_dir] = (base, tname)
+                    return cand, f"{bname}:{tname}", tried
+        # nothing existed -> best-guess path (label_dir/rel) for the report
+        return os.path.join(label_dir, rel), None, tried[:6]
 
 
 # --------------------------------------------------------------------------- #
@@ -199,6 +281,7 @@ def check_entry(entry, resolver, ctx_len, do_decode):
         "label_file": label_file, "lineno": lineno, "apath": apath,
         "text": text, "status": "ok", "reason": "",
         "sr": None, "n_ch": None, "dur": None, "token_len": None,
+        "resolve_scheme": None,
     }
 
     # transcript / parsing sanity
@@ -208,11 +291,13 @@ def check_entry(entry, resolver, ctx_len, do_decode):
         r["reason"] = f"audio path has no known audio extension ({ext or 'none'}); " \
                       f"possible .label parsing issue (path with spaces?)"
 
-    path = resolver.resolve(apath)
+    path, scheme, tried = resolver.resolve(apath, label_file)
     r["resolved"] = path
-    if not os.path.exists(path):
+    r["resolve_scheme"] = scheme
+    if scheme is None:
         r["status"] = "missing"
-        r["reason"] = "audio file not found"
+        r["reason"] = ("audio file not found; tried: "
+                       + ", ".join(tried[:4]) + (" ..." if len(tried) > 4 else ""))
         return r
 
     # header-only info (cheap) — works for wav/flac; mp3 may need full decode
@@ -356,6 +441,7 @@ class Aggregator:
         self.sr = Counter()
         self.ch = Counter()
         self.fmt = Counter()
+        self.scheme = Counter()      # which path-resolution scheme succeeded
         self.dur_hist = [0] * (len(DUR_EDGES) + 1)
         self.tl_hist = [0] * (len(self.tl_edges) + 1)
         self.dur_n = self.dur_sum = 0
@@ -374,6 +460,7 @@ class Aggregator:
     def add(self, r):
         st = r["status"]
         self.status[st] += 1
+        self.scheme[r.get("resolve_scheme") or "MISSING"] += 1
         if r.get("sr") is not None:
             self.sr[r["sr"]] += 1
         if r.get("n_ch") is not None:
@@ -416,6 +503,13 @@ class Aggregator:
     def print_summary(self):
         print(f"\n========== SUMMARY ==========")
         print(f"status counts: {dict(self.status)}")
+        # path resolution breakdown — which scheme located the audio (MISSING = none)
+        sch = dict(sorted(self.scheme.items(), key=lambda kv: -kv[1]))
+        print(f"path resolution: {sch}")
+        found = sum(v for k, v in self.scheme.items() if k != "MISSING")
+        total = sum(self.scheme.values()) or 1
+        print(f"               resolved {found}/{total} ({100*found/total:.1f}%) | "
+              f"MISSING {self.scheme.get('MISSING', 0)}")
         print(f"sample rate  : {dict(self.sr)}")
         print(f"channels     : {dict(self.ch)}")
         print(f"format       : {dict(self.fmt)}")
@@ -487,6 +581,9 @@ def main():
     ap.add_argument("--root", required=True, help="root folder containing *.label files")
     ap.add_argument("--ctx_len", type=int, default=1024, help="context length (matches training)")
     ap.add_argument("--label_exclude", default="", help="comma-separated keywords to skip (e.g. misc,noise)")
+    ap.add_argument("--decode_errors", choices=["skip", "ignore"], default="skip",
+                    help="how to handle a .label file that is not valid UTF-8: "
+                         "'skip' the whole file with a warning (default), or 'ignore' bad bytes and keep its good lines")
     ap.add_argument("--frac", type=float, default=None,
                     help="STRATIFIED spot-check: keep a random fraction (e.g. 0.05 = 5%%) of EACH "
                          ".label file's entries; the rest are never touched (best for multi-TB data). "
@@ -496,6 +593,12 @@ def main():
     ap.add_argument("--workers", type=int, default=8, help="threads for the decode pass")
     ap.add_argument("--show", type=int, default=3, help="fully-built training samples to print (deep check)")
     ap.add_argument("--seed", type=int, default=42, help="sampling seed")
+    ap.add_argument("--audio_root", default=None,
+                    help="explicit base dir for relative audio paths (tried first); use when audio "
+                         "lives outside the .label tree")
+    ap.add_argument("--max_up", type=int, default=2,
+                    help="how many parent levels above each .label dir to try when resolving "
+                         "off-by-one relative paths (default 2)")
     ap.add_argument("--examples", type=int, default=8, help="problem examples to print per category")
     ap.add_argument("--report", default="label_check_report.jsonl",
                     help="write the FULL list of problem entries here as JSONL (default: ./label_check_report.jsonl)")
@@ -521,9 +624,13 @@ def main():
         print(f"exclude keywords: {keywords}")
     if args.frac is not None:
         print(f"stratified sample: {args.frac:.1%} per .label file (seed={args.seed})")
-    index, idx_stats = load_label_index(args.root, keywords, frac=args.frac, seed=args.seed)
+    index, idx_stats = load_label_index(args.root, keywords, frac=args.frac, seed=args.seed,
+                                        decode_errors=args.decode_errors)
     print(f".label files scanned : {idx_stats['n_files']} "
           f"(excluded by keyword: {idx_stats['n_files_excluded']})")
+    if idx_stats.get("n_decode_error") or idx_stats.get("n_read_error"):
+        print(f".label files skipped : {idx_stats.get('n_decode_error', 0)} (not valid UTF-8), "
+              f"{idx_stats.get('n_read_error', 0)} (read error)")
     if idx_stats.get("sampled"):
         print(f"valid entries (total): {idx_stats['n_before_sample']}")
         print(f"utterances sampled   : {len(index)} "
@@ -538,7 +645,7 @@ def main():
               "'<audio_path><whitespace><transcript>'.")
         sys.exit(1)
 
-    resolver = PathResolver(args.root)
+    resolver = PathResolver(args.root, audio_root=args.audio_root, max_up=args.max_up)
 
     # ---- 2) decide which entries to fully decode ----
     # --frac already subsampled the index, so fully decode all of the sampled set.

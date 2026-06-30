@@ -18,6 +18,7 @@
 #   MICRO_BSZ CTX_LEN EPOCH_COUNT EPOCH_STEPS EPOCH_SAVE NUM_WORKERS ACCUM GRAD_CP PRECISION
 #   DATA_SHUFFLE  (1=on default, 0=off)
 #   LABEL_EXCLUDE (data_type=label: comma-separated keywords to skip, e.g. "misc,noise")
+#   AUDIO_ROOT RESOLVE_MAX_UP (data_type=label: audio path resolution; see docs/check-label-dataset.md)
 #   DEVICES NUM_NODES STRATEGY ACCELERATOR LAUNCHER
 #   TRAIN_STEP LR_INIT LR_FINAL WARMUP LAYERWISE_LR
 #   LORA_TMIX LORA_FFN LORA_ALPHA LORA_DROPOUT
@@ -31,6 +32,8 @@ cd "$(dirname "$0")/.."          # repo root
 LOAD_MODEL=${LOAD_MODEL:-models/rwkv7-g1g-1.5b-20260526-ctx8192.pth}
 DATA_TYPE=${DATA_TYPE:-asr}                # asr = pre-materialized | label = on-the-fly *.label folder
 DATA_FILE=${DATA_FILE:-./localdataset}     # asr: save_to_disk dir | label: root folder of *.label files
+AUDIO_ROOT=${AUDIO_ROOT:-}                  # data_type=label: explicit base dir for relative audio (tried first)
+RESOLVE_MAX_UP=${RESOLVE_MAX_UP:-2}         # data_type=label: parent levels tried for off-by-one paths
 ENCODER_PATH=${ENCODER_PATH:-microsoft/wavlm-large}
 RESUME=${RESUME:-}                         # Stage-2: path to a Stage-1 rwkv-*.pth
 OUT_DIR=${OUT_DIR:-out}
@@ -121,6 +124,7 @@ $LAUNCHER python train.py \
   --proj_dir "$PROJ_DIR" --data_file "$DATA_FILE" \
   --data_type $DATA_TYPE --vocab_size $VOCAB --data_shuffle $DATA_SHUFFLE \
   --label_exclude "$LABEL_EXCLUDE" \
+  --audio_root "$AUDIO_ROOT" --resolve_max_up $RESOLVE_MAX_UP \
   --n_layer $N_LAYER --n_embd $N_EMBD \
   --ctx_len $CTX_LEN --micro_bsz $MICRO_BSZ \
   --epoch_steps $EPOCH_STEPS --epoch_count $EPOCH_COUNT --epoch_begin 0 --epoch_save $EPOCH_SAVE \

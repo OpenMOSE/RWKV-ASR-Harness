@@ -29,6 +29,9 @@
 #   EXAMPLES       problem examples printed per category    (default 8)
 #   REPORT         path for the FULL problem list (JSONL)   (default label_check_report.jsonl)
 #   NO_REPORT      1 = do not write a report file           (default 0)
+#   DECODE_ERRORS  non-UTF-8 .label files: skip | ignore     (default skip)
+#   AUDIO_ROOT     explicit base dir for relative audio paths (tried first; default: off)
+#   MAX_UP         parent levels tried for off-by-one paths   (default 2)
 #   STRICT         1 = exit non-zero if any problem found   (default 0)
 #
 # For a huge dataset use CHECK_ALL=1: the terminal shows only streamed counters
@@ -45,9 +48,13 @@ WORKERS=${WORKERS:-8}
 SHOW=${SHOW:-3}
 EXAMPLES=${EXAMPLES:-8}
 REPORT=${REPORT:-label_check_report.jsonl}
+DECODE_ERRORS=${DECODE_ERRORS:-skip}     # skip = drop non-UTF-8 .label files | ignore = drop bad bytes
+MAX_UP=${MAX_UP:-2}                       # parent levels tried for off-by-one relative paths
 
 ARGS=(--root "$ROOT" --ctx_len "$CTX_LEN" --max_check "$MAX_CHECK" \
-      --workers "$WORKERS" --show "$SHOW" --examples "$EXAMPLES" --report "$REPORT")
+      --workers "$WORKERS" --show "$SHOW" --examples "$EXAMPLES" --report "$REPORT" \
+      --decode_errors "$DECODE_ERRORS" --max_up "$MAX_UP")
+[ -n "${AUDIO_ROOT:-}" ] && ARGS+=(--audio_root "$AUDIO_ROOT")
 [ -n "$LABEL_EXCLUDE" ] && ARGS+=(--label_exclude "$LABEL_EXCLUDE")
 [ -n "${FRAC:-}" ] && ARGS+=(--frac "$FRAC")
 [ "${CHECK_ALL:-0}" = "1" ] && ARGS+=(--check_all)

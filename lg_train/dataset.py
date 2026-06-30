@@ -47,8 +47,17 @@ class WorldDataset(Dataset):
             # On-the-fly ASR from scattered *.label files under a root folder.
             # Each .label line: "<rel/audio/path><space|TAB><transcript...>"
             # Audio is decoded lazily in __getitem__ (no preprocessing).
-            self._label_root = args.data_file
-            self._path_base = None        # resolved once (see _resolve_audio_path)
+            self._label_root = os.path.normpath(args.data_file)
+            self._audio_root = getattr(args, "audio_root", None) or None
+            if self._audio_root:
+                self._audio_root = os.path.normpath(self._audio_root)
+            self._resolve_max_up = int(getattr(args, "resolve_max_up", 2) or 0)
+            self._path_cache = {}         # label_dir -> winning (base, transform)
+            # skip visibility: silent data loss is the #1 cause of "overfit on
+            # 3TB after a few steps" -> count & periodically log what's dropped.
+            self._label_reads = 0
+            self._label_skips = 0
+            self._skip_log_every = 2000
             self.data = self._load_label_index(args.data_file)
         elif args.data_type == 'autoimg':
             self.data = self._load_hf_dataset(args.data_file)
@@ -149,17 +158,33 @@ class WorldDataset(Dataset):
         elif t == 'asr':
             out = self._process_asr(sample)
         elif t == 'label':
-            # on-the-fly: some audio may be missing/corrupt/too-long -> skip to next
+            # on-the-fly: some audio may be missing/corrupt/too-long -> skip to next.
+            # Skips are COUNTED and periodically logged: a high skip rate means the
+            # effective dataset is far smaller than len(self.data) (silent data loss
+            # -> overfitting). Watch for "[label] skip rate" lines in the logs.
             out = None
+            last_err = ""
             for _ in range(64):
                 try:
                     out = self._process_label(self.data[idx])
                     used_idx, used_sample = idx, self.data[idx]
+                    self._label_reads += 1
                     break
-                except Exception:
+                except Exception as e:
+                    self._label_skips += 1
+                    last_err = f"{type(e).__name__}: {str(e)[:100]}"
+                    if self._label_skips % self._skip_log_every == 0:
+                        total = self._label_reads + self._label_skips
+                        rate = 100.0 * self._label_skips / max(total, 1)
+                        print(f"[label] skip rate {rate:.1f}% "
+                              f"({self._label_skips} skipped / {self._label_reads} ok) "
+                              f"| last: {last_err}", flush=True)
                     idx = (idx + 1) % len(self.data)
             if out is None:
-                raise RuntimeError("too many unreadable audio entries in 'label' dataset")
+                raise RuntimeError(
+                    f"too many unreadable audio entries in 'label' dataset "
+                    f"(64 consecutive skips; last error: {last_err}). "
+                    f"Check audio paths / --audio_root with scripts/check_label.sh")
         elif t == 'jsonl':
             return sample
         elif t == 'autoimg':
@@ -177,7 +202,7 @@ class WorldDataset(Dataset):
         """Short human-readable id of a dataset entry (for --debug_data)."""
         try:
             if self.data_type == 'label':
-                p, txt = sample
+                _label_dir, p, txt = sample
                 return f"#{idx}:{os.path.basename(p)}|{str(txt)[:24]}"
             if isinstance(sample, dict):
                 txt = sample.get('transcription') or sample.get('text') or sample.get('texts') or ''
@@ -265,16 +290,23 @@ class WorldDataset(Dataset):
     # on-the-fly ASR from *.label folders
     # ------------------------------
     def _load_label_index(self, root):
-        """Recursively scan `root` for *.label files and build a (rel_path, text)
-        index. Each line: '<audio_path><whitespace><transcript>'. Only the text
-        index is held in memory; audio is decoded on demand in _process_label.
+        """Recursively scan `root` for *.label files and build a
+        (label_dir, audio_path, text) index. Each line:
+        '<audio_path><whitespace><transcript>'. Only the text index is held in
+        memory (label_dir is interned -> shared across a file's entries); audio
+        is decoded on demand in _process_label. Keeping label_dir lets
+        _resolve_audio_path try paths relative to the .label file's own folder,
+        which is the common real-world layout.
 
+        Non-UTF-8 .label files are skipped with a warning (not fatal).
         --label_exclude "misc,noise" skips any entry whose audio path (or its
         source .label file path) contains one of the comma-separated keywords
         (case-insensitive substring match). Useful to drop e.g. a 'misc/' folder."""
+        import sys
         excl = (getattr(self.args, "label_exclude", "") or "")
         keywords = [k.strip().lower() for k in excl.split(",") if k.strip()]
         n_skipped = 0
+        n_decode_error = 0
 
         index = []
         n_files = 0
@@ -287,6 +319,7 @@ class WorldDataset(Dataset):
                 if keywords and any(kw in fpath.lower() for kw in keywords):
                     continue
                 n_files += 1
+                label_dir = sys.intern(dirpath)   # shared by all entries of this file
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
                         for line in f:
@@ -302,41 +335,81 @@ class WorldDataset(Dataset):
                                 n_skipped += 1
                                 continue
                             if text:
-                                index.append((apath, text))
+                                index.append((label_dir, apath, text))
+                except UnicodeDecodeError as e:
+                    n_decode_error += 1
+                    print(f"⚠️ skip .label (not valid UTF-8: {e}): {fpath}")
                 except Exception as e:
                     print(f"⚠️ skip label file {fpath}: {e}")
         if keywords:
             print(f"[label] exclude keywords={keywords} -> skipped {n_skipped} entries (+ matching .label files)")
+        if n_decode_error:
+            print(f"[label] skipped {n_decode_error} .label files (not valid UTF-8)")
         print(f"[label] scanned {n_files} .label files -> {len(index)} utterances under {root}")
         return index
 
-    def _resolve_audio_path(self, rel):
-        """Resolve a label entry's audio path. Handles the common case where the
-        entry is like 'voice-dataset/ja/WAVE/001.wav' but root is '/share/voice-dataset'
-        (i.e. the entry already includes the root's basename)."""
+    def _resolve_audio_path(self, rel, label_dir):
+        """Resolve a label entry's audio path, robust to mixed conventions:
+        absolute / relative to the .label file's own dir / relative to the
+        dataset root (or its parent) / off-by-one (an extra or missing leading
+        directory). Tries a prioritized list of (base, transform) candidates and
+        CACHES the winning scheme per label_dir, so only the first entry of each
+        .label file pays the search cost.  Returns (path, found_bool)."""
         if os.path.isabs(rel):
-            return rel
-        if self._path_base is not None:
-            return os.path.join(self._path_base, rel)
-        root = os.path.normpath(self._label_root)
-        candidates = [
-            os.path.dirname(root),   # /share  + voice-dataset/...  -> /share/voice-dataset/...
-            root,                    # /share/voice-dataset + ja/... (if entries omit the prefix)
-        ]
-        for base in candidates:
-            if os.path.exists(os.path.join(base, rel)):
-                self._path_base = base   # cache the working scheme
-                return os.path.join(base, rel)
-        return os.path.join(candidates[0], rel)   # default; load will fail -> entry skipped
+            return rel, os.path.exists(rel)
+
+        # fast path: reuse the scheme that already worked for this .label dir
+        plan = self._path_cache.get(label_dir)
+        if plan is not None:
+            base, strip1 = plan
+            cand = self._apply_scheme(base, strip1, rel)
+            if cand and os.path.exists(cand):
+                return cand, True
+
+        # candidate base dirs, most-likely first
+        root = self._label_root
+        bases = []
+        if self._audio_root:
+            bases.append(self._audio_root)
+        bases.append(label_dir)                       # relative to the .label file
+        d = label_dir
+        for _ in range(self._resolve_max_up):          # walk up (missing-dir off-by-one)
+            d = os.path.dirname(d)
+            if d:
+                bases.append(d)
+        bases.append(root)
+        bases.append(os.path.dirname(root))
+        seen = set()
+        for base in bases:
+            if not base or base in seen:
+                continue
+            seen.add(base)
+            for strip1 in (False, True):               # asis / drop extra leading dir
+                cand = self._apply_scheme(base, strip1, rel)
+                if cand and os.path.exists(cand):
+                    self._path_cache[label_dir] = (base, strip1)
+                    return cand, True
+        return os.path.join(label_dir, rel), False     # best-guess; caller will skip
+
+    @staticmethod
+    def _apply_scheme(base, strip1, rel):
+        if strip1:
+            parts = rel.split(os.sep)
+            if len(parts) <= 1:
+                return None
+            rel = os.sep.join(parts[1:])
+        return os.path.join(base, rel)
 
     def _process_label(self, sample):
-        """(audio_path, transcript) -> (waveform, input_ids, label_ids), decoded on the fly."""
+        """(label_dir, audio_path, transcript) -> (waveform, input_ids, label_ids)."""
         import numpy as np
         import soundfile as sf
         from .encoder.speech_encoder import speech_token_len
 
-        apath, text = sample
-        path = self._resolve_audio_path(apath)
+        label_dir, apath, text = sample
+        path, found = self._resolve_audio_path(apath, label_dir)
+        if not found:
+            raise FileNotFoundError(f"unresolved audio path: {apath}")
         try:
             wav, sr = sf.read(path, dtype="float32")
             if wav.ndim > 1:
