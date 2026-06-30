@@ -236,10 +236,10 @@ class PathResolver:
         # fast path: reuse the scheme that already worked for this .label dir
         plan = self._cache.get(label_dir)
         if plan is not None:
-            base, tname = plan
+            base, tname, bname = plan
             cand = self._apply(base, tname, rel)
             if cand and os.path.exists(cand):
-                return cand, tname, tried
+                return cand, f"{bname}:{tname}", tried
 
         # full search over (base, transform), most-likely first
         for bname, base in self._bases(label_dir):
@@ -249,7 +249,7 @@ class PathResolver:
                     continue
                 tried.append(cand)
                 if os.path.exists(cand):
-                    self._cache[label_dir] = (base, tname)
+                    self._cache[label_dir] = (base, tname, bname)
                     return cand, f"{bname}:{tname}", tried
         # nothing existed -> best-guess path (label_dir/rel) for the report
         return os.path.join(label_dir, rel), None, tried[:6]
@@ -526,6 +526,32 @@ class Aggregator:
         if non16k:
             print(f"[note] {non16k} clips are not 16 kHz (will be resampled on the fly).")
 
+    def to_dict(self):
+        """Machine-readable summary (written to --summary)."""
+        found = sum(v for k, v in self.scheme.items() if k != "MISSING")
+        total = sum(self.scheme.values())
+        dur = None
+        if self.dur_n:
+            dur = {"n": self.dur_n, "min": round(self.dur_min, 3),
+                   "mean": round(self.dur_sum / self.dur_n, 3), "max": round(self.dur_max, 3),
+                   "hist": dict(zip(_hist_labels(DUR_EDGES, "s"), self.dur_hist))}
+        tl = None
+        if self.tl_n:
+            tl = {"n": self.tl_n, "min": self.tl_min,
+                  "mean": round(self.tl_sum / self.tl_n, 1), "max": self.tl_max,
+                  "over_limit": self.tl_over, "room": self.room,
+                  "hist": dict(zip(_hist_labels(self.tl_edges), self.tl_hist))}
+        return {
+            "status_counts": dict(self.status),
+            "path_resolution": dict(sorted(self.scheme.items(), key=lambda kv: -kv[1])),
+            "resolved": found, "checked": total,
+            "resolved_pct": round(100 * found / max(total, 1), 2),
+            "missing": self.scheme.get("MISSING", 0),
+            "sample_rate": dict(self.sr), "channels": dict(self.ch), "format": dict(self.fmt),
+            "duration": dur, "token_len": tl,
+            "problems_written": self.n_problems_written, "report_path": self.report_path,
+        }
+
     def print_examples(self):
         for cat in PROBLEM_STATUSES:
             n = self.status.get(cat, 0)
@@ -603,6 +629,9 @@ def main():
     ap.add_argument("--report", default="label_check_report.jsonl",
                     help="write the FULL list of problem entries here as JSONL (default: ./label_check_report.jsonl)")
     ap.add_argument("--no_report", action="store_true", help="do not write a report file")
+    ap.add_argument("--summary", default="label_check_summary.json",
+                    help="write the run summary (status counts, resolution %%, histograms) here as JSON")
+    ap.add_argument("--no_summary", action="store_true", help="do not write a summary file")
     ap.add_argument("--strict", action="store_true", help="exit non-zero if any problem is found")
     args = ap.parse_args()
 
@@ -680,10 +709,11 @@ def main():
     by_status = agg.status
     n_problems = (by_status.get("missing", 0) + by_status.get("decode_fail", 0)
                   + by_status.get("too_long", 0))
+    passed = (n_problems == 0) and (n_mismatch in (None, 0))
     print(f"\n========== VERDICT ==========")
     if report_path and (n_problems or by_status.get("warn", 0)):
         print(f"full problem list ({agg.n_problems_written} entries): {report_path}")
-    if n_problems == 0 and (n_mismatch in (None, 0)):
+    if passed:
         print("PASS — index loads, audio decodes, and placeholder/label extraction aligns.")
         code = 0
     else:
@@ -691,6 +721,28 @@ def main():
               + (f", alignment mismatches={n_mismatch}" if n_mismatch else "")
               + f", warnings={by_status.get('warn', 0)}")
         code = 1 if args.strict else 0
+
+    # ---- 8) persistent summary file (so it doesn't scroll away on huge runs) ----
+    if not args.no_summary:
+        summary = {
+            "root": args.root, "ctx_len": args.ctx_len, "frac": args.frac,
+            "audio_root": args.audio_root, "decode_errors": args.decode_errors,
+            "label_files_scanned": idx_stats.get("n_files"),
+            "label_files_skipped_bad_utf8": idx_stats.get("n_decode_error"),
+            "valid_entries_total": idx_stats.get("n_before_sample"),
+            "entries_indexed": len(index),
+            "entries_checked": len(decode_set),
+            "deep_alignment_mismatches": n_mismatch,
+            "hard_problems": n_problems,
+            "verdict": "PASS" if passed else "ISSUES",
+            **agg.to_dict(),
+        }
+        try:
+            with open(args.summary, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+            print(f"\nsummary written -> {args.summary}")
+        except OSError as e:
+            print(f"[warn] could not write summary {args.summary}: {e}")
     sys.exit(code)
 
 

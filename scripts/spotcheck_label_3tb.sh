@@ -46,8 +46,29 @@ run_stage() {
     ROOT="$ROOT" CTX_LEN="$CTX_LEN" WORKERS="$WORKERS" \
         FRAC="$frac" \
         LABEL_EXCLUDE="${LABEL_EXCLUDE:-}" \
+        AUDIO_ROOT="${AUDIO_ROOT:-}" MAX_UP="${MAX_UP:-2}" \
         REPORT="$REPORT_DIR/problems-frac$frac.jsonl" \
+        SUMMARY="$REPORT_DIR/summary-frac$frac.json" \
         bash scripts/check_label.sh
+}
+
+# Compact digest from a stage's summary JSON (resolution rate + status counts).
+digest() {
+    local frac=$1 sumfile="$REPORT_DIR/summary-frac$1.json"
+    [ -f "$sumfile" ] || return 0
+    python - "$sumfile" "$frac" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+print(f"  FRAC={sys.argv[2]}: checked={s['entries_checked']}  "
+      f"resolved={s['resolved_pct']}%  missing={s['missing']}  "
+      f"verdict={s['verdict']}")
+print(f"     status      : {s['status_counts']}")
+print(f"     resolution  : {s['path_resolution']}")
+tl = s.get('token_len') or {}
+if tl:
+    print(f"     token_len   : mean={tl['mean']} max={tl['max']} over_ctx={tl['over_limit']}")
+print(f"     problems    : {s['problems_written']} -> {s['report_path']}")
+PY
 }
 
 if [ "$STAGE" = "both" ] || [ "$STAGE" = "1" ]; then
@@ -58,5 +79,11 @@ if [ "$STAGE" = "both" ] || [ "$STAGE" = "2" ]; then
 fi
 
 echo
-echo "=== done. problem reports under: $REPORT_DIR/ ==="
-echo "    inspect e.g.:  python -c \"import json,collections;print(collections.Counter(json.loads(l)['status'] for l in open('$REPORT_DIR/problems-frac$STAGE2_FRAC.jsonl')))\""
+echo "================================================================"
+echo "=== DIGEST (reports + summaries under: $REPORT_DIR/) ==="
+echo "================================================================"
+if [ "$STAGE" = "both" ] || [ "$STAGE" = "1" ]; then digest "$STAGE1_FRAC"; fi
+if [ "$STAGE" = "both" ] || [ "$STAGE" = "2" ]; then digest "$STAGE2_FRAC"; fi
+echo
+echo "  full summaries : $REPORT_DIR/summary-frac*.json"
+echo "  problem lists  : $REPORT_DIR/problems-frac*.jsonl"

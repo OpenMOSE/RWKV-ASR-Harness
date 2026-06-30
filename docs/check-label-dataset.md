@@ -94,6 +94,7 @@ ROOT=/share/voice-dataset STRICT=1 ./scripts/check_label.sh
 | `SHOW` | `3` | トークン化詳細を表示するサンプル数 |
 | `EXAMPLES` | `8` | カテゴリごとに表示する問題例の数 |
 | `REPORT` | `label_check_report.jsonl` | 問題行の**全リスト**を書き出す JSONL パス |
+| `SUMMARY` | `label_check_summary.json` | 実行サマリ（解決率・status内訳・ヒストグラム）の JSON パス |
 | `NO_REPORT` | `0` | `1` でレポートファイルを書かない |
 | `DECODE_ERRORS` | `skip` | UTF-8 として不正な `.label` ファイルの扱い。`skip`=警告してファイルごとスキップ / `ignore`=不正バイトのみ捨てて有効行は採用 |
 | `STRICT` | `0` | `1` で問題検出時に exit code 1 |
@@ -110,6 +111,16 @@ ROOT=/share/voice-dataset FRAC=0.01 ./scripts/check_label.sh
 ROOT=/share/voice-dataset FRAC=0.05 WORKERS=16 ./scripts/check_label.sh
 ```
 
+- `scripts/spotcheck_label_3tb.sh` は各ステージのレポートとサマリを
+  `out/label-check/`（`REPORT_DIR`）に保存し、最後に**ダイジェスト**を表示します:
+  ```
+  FRAC=0.05: checked=42230  resolved=99.9%  missing=30  verdict=PASS
+     status      : {'ok': 42200, 'missing': 30}
+     resolution  : {'label_dir:asis': 41000, 'abs': 1200, 'MISSING': 30}
+     problems    : 30 -> out/label-check/problems-frac0.05.jsonl
+  ```
+  長いログが流れても、解決率・status内訳がこのダイジェストと `summary-frac*.json`
+  に必ず残ります。
 - 抽出は **各 `.label` ファイル単位**（層化）なので、フォルダ/コーパスごとの
   偏りなく全体を代表します。`SEED`（既定42）で再現可能。
 - 抽出された分は**フルデコード**され、音声整合性・token_len・ラベル整合まで検査

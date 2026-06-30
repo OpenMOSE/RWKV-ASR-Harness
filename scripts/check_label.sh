@@ -28,6 +28,7 @@
 #   SHOW           fully-built training samples to print    (default 3)
 #   EXAMPLES       problem examples printed per category    (default 8)
 #   REPORT         path for the FULL problem list (JSONL)   (default label_check_report.jsonl)
+#   SUMMARY        path for the run summary (JSON)          (default label_check_summary.json)
 #   NO_REPORT      1 = do not write a report file           (default 0)
 #   DECODE_ERRORS  non-UTF-8 .label files: skip | ignore     (default skip)
 #   AUDIO_ROOT     explicit base dir for relative audio paths (tried first; default: off)
@@ -48,11 +49,13 @@ WORKERS=${WORKERS:-8}
 SHOW=${SHOW:-3}
 EXAMPLES=${EXAMPLES:-8}
 REPORT=${REPORT:-label_check_report.jsonl}
+SUMMARY=${SUMMARY:-label_check_summary.json}
 DECODE_ERRORS=${DECODE_ERRORS:-skip}     # skip = drop non-UTF-8 .label files | ignore = drop bad bytes
 MAX_UP=${MAX_UP:-2}                       # parent levels tried for off-by-one relative paths
 
 ARGS=(--root "$ROOT" --ctx_len "$CTX_LEN" --max_check "$MAX_CHECK" \
-      --workers "$WORKERS" --show "$SHOW" --examples "$EXAMPLES" --report "$REPORT" \
+      --workers "$WORKERS" --show "$SHOW" --examples "$EXAMPLES" \
+      --report "$REPORT" --summary "$SUMMARY" \
       --decode_errors "$DECODE_ERRORS" --max_up "$MAX_UP")
 [ -n "${AUDIO_ROOT:-}" ] && ARGS+=(--audio_root "$AUDIO_ROOT")
 [ -n "$LABEL_EXCLUDE" ] && ARGS+=(--label_exclude "$LABEL_EXCLUDE")
